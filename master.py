@@ -3,8 +3,7 @@
 Master Controller – CyberOps Edition
 Dual‑mode: VPS (TCP) + Render (WebSocket) with toggle.
 Login required (admin/admin) with mode selection.
-Keep‑alive thread prevents Render from sleeping.
-Auto‑detects Render URL from environment.
+Render‑friendly: health endpoint, no internal keep‑alive.
 """
 
 import socket
@@ -16,7 +15,6 @@ import json
 import os
 import hashlib
 import secrets
-import requests
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, redirect, session, url_for
 from flask_socketio import SocketIO, emit, disconnect
@@ -304,16 +302,6 @@ app.config['SECRET_KEY'] = secrets.token_hex(16)
 app.config['SESSION_COOKIE_SECURE'] = False  # set to True if using HTTPS
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# ========== KEEPALIVE ==========
-def keepalive_loop():
-    """Ping the app every 5 minutes to prevent Render from sleeping."""
-    while True:
-        time.sleep(300)  # 5 minutes
-        try:
-            requests.get(f"http://localhost:{WEB_PORT}/keepalive", timeout=5)
-        except Exception:
-            pass
-
 # ========== LOGIN / AUTH ==========
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -374,15 +362,24 @@ def login():
             return render_template_string(LOGIN_HTML, error='Invalid credentials')
     return render_template_string(LOGIN_HTML, error=None)
 
-@app.before_request
-def require_login():
-    if request.endpoint and request.endpoint not in ('login', 'static', 'keepalive'):
-        if not session.get('logged_in'):
-            return redirect(url_for('login'))
+# Health check – no authentication required
+@app.route('/health')
+def health():
+    return "OK", 200
 
+# Keep alive endpoint (optional, for external pings) – no auth
 @app.route('/keepalive')
 def keepalive():
-    return "ok", 200
+    return "OK", 200
+
+@app.before_request
+def require_login():
+    # Allow health and keepalive without login
+    if request.endpoint and request.endpoint in ('health', 'keepalive'):
+        return
+    if request.endpoint and request.endpoint not in ('login', 'static'):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
 
 # ========== SOCKETIO EVENTS ==========
 @socketio.on('connect')
@@ -1847,7 +1844,8 @@ def generate_ws_slave_script(slave_id: str, slave_name: str) -> str:
         if MASTER_IP.startswith('http://') or MASTER_IP.startswith('https://'):
             master_url = MASTER_IP.rstrip('/')
         else:
-            master_url = f"http://{MASTER_IP}:{WEB_PORT}"  # fallback to HTTP with port
+            # For local testing with HTTP
+            master_url = f"http://{MASTER_IP}:{WEB_PORT}"
 
     return f'''#!/usr/bin/env python3
 # =============================================
@@ -2085,7 +2083,12 @@ if __name__ == '__main__':
         print(f"  Render URL : {RENDER_URL}")
     print(f"  Current mode: {CURRENT_MODE.upper()}")
     print("=" * 52)
+
     load_slaves()
-    threading.Thread(target=tcp_server_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
+
+    # Start TCP server in background
+    tcp_thread = threading.Thread(target=tcp_server_loop, daemon=True)
+    tcp_thread.start()
+
+    # Start SocketIO server (this blocks)
     socketio.run(app, host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
